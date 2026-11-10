@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PoseDataset-Scout (prototype)</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:18px;color:#222}
+textarea{width:100%;height:120px;font-family:monospace}
+button{padding:8px 12px;margin:6px}
+pre{background:#f5f5f5;padding:8px;border-radius:4px}
+.row{display:flex;gap:8px;align-items:center}
+.small{font-size:0.9em;color:#555}
+</style>
+</head>
+<body>
+<h2>PoseDataset-Scout — prototype</h2>
+<p class="small">I am Marmalade, cat and curator of small experiments. This page scans listed pages for dataset-like links and simple embedded arrays, then creates a CSV report. Heuristics only.</p>
+<label>Targets (one URL per line):</label>
+<textarea id="targets">https://en.wikipedia.org/wiki/Pose
+https://africavernaculararchitecture.com/</textarea>
+<label>CORS proxy (optional):</label>
+<input id="proxy" style="width:100%" placeholder="e.g. https://cors.bridged.cc/" />
+<div class="row"><button id="run">Run Scan</button><button id="download" disabled>Download CSV</button></div>
+<div id="log"></div>
+<script>
+function log(msg){const d=document.getElementById('log');d.innerHTML += '<div>'+msg+'</div>'; d.scrollTop = d.scrollHeight}
+function guessMimeByExt(u){u = u.split('?')[0].toLowerCase(); if(u.endsWith('.csv')) return 'text/csv'; if(u.endsWith('.json')) return 'application/json'; if(u.endsWith('.zip')) return 'application/zip'; if(u.endsWith('.txt')) return 'text/plain'; return '';}
+function escapeCsvCell(s){ if(s==null) return ''; return '"'+String(s).replace(/"/g,'""')+'"'; }
+async function fetchText(url, proxy){ try{ const fetchUrl = proxy? (proxy + url) : url; const r = await fetch(fetchUrl); const text = await r.text(); return {ok: r.ok, status: r.status, text}; } catch(e){ return {ok:false, status: String(e), text: ''}; }}
+function scanHtmlForLinks(html, baseUrl){ const a = []; const linkRegex = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([^<]*)<\/a>/ig; let m; while((m = linkRegex.exec(html))){ let href = m[1]; let text = m[2].trim(); if(!href) continue; try{ href = new URL(href, baseUrl).href }catch(e){ continue } a.push({href,text}); } return a }
+function findJsArrays(html){ // look for large JS arrays like var data = [ ... ] or "=[ [1,2],... ]"
+ const results = [];
+ const patterns = [/([a-zA-Z_$][\w$]{0,50})\s*=\s*\[\s*\[[^\]]{10,}\]/g, /\[\s*\[\s*\d{1,3}[,\s]+\d{1,3}[\s,]+\d{1,3}/g];
+ for(const p of patterns){ let m; while((m=p.exec(html))){ results.push({snippet: html.substr(Math.max(0,m.index-50), Math.min(300, html.length-m.index+50))}); }}
+ return results }
+
+async function analyzeUrl(url, proxy){ log('Scanning '+url);
+ const r = await fetchText(url, proxy);
+ if(!r.ok){ log('  fetch failed: '+r.status); return {source:url, error:String(r.status), findings:[]}; }
+ const html = r.text;
+ const links = scanHtmlForLinks(html, url);
+ const findings = [];
+ for(const L of links){ const href = L.href.toLowerCase(); const mimeHint = guessMimeByExt(href);
+ if(href.endsWith('.csv')|| href.endsWith('.json')|| href.endsWith('.zip')|| href.startsWith('data:') ){ findings.push({source:url, link:L.href, linkText:L.text || '', mimeHint, snippet: '', accessible:true}); }
+ else if(/\.(csv|json|zip)($|\?)/.test(href)){ findings.push({source:url, link:L.href, linkText:L.text||'', mimeHint, snippet:'', accessible:true}); }
+ }
+ // simple heuristic: embedded JSON or JS arrays
+ const jsArrays = findJsArrays(html);
+ for(const s of jsArrays){ findings.push({source:url, link:'(embedded)', linkText:'embedded-array', mimeHint:'application/javascript', snippet: s.snippet.replace(/\s+/g,' ').slice(0,200), accessible:true}); }
+ // If no explicit file links found, also look for script tags that include .json in src
+ const scriptRegex = /<script[^>]+src=["']([^"']+\.json)["']/ig; let m; while((m=scriptRegex.exec(html))){ try{ const absolute = new URL(m[1], url).href; findings.push({source:url, link:absolute, linkText:'script-json', mimeHint:'application/json', snippet:'', accessible:true}); }catch(e){} }
+ log('  found '+findings.length+' candidate(s)');
+ return {source:url, findings}; }
+
+function toCsv(reportRows){ const header = ['source_url','link','link_text','mime_hint','content_snippet','accessible']; const lines=[header.map(escapeCsvCell).join(',')];
+ for(const r of reportRows){ lines.push([r.source,r.link,r.linkText||'',r.mimeHint||'',r.snippet||'',String(!!r.accessible)].map(escapeCsvCell).join(',')); }
+ return lines.join('\n'); }
+
+document.getElementById('run').addEventListener('click', async ()=>{
+ document.getElementById('log').innerHTML=''; const txt = document.getElementById('targets').value.trim(); if(!txt){ log('No targets listed'); return }
+ const proxy = (document.getElementById('proxy').value||'').trim(); const urls = txt.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+ const aggregate = [];
+ for(const u of urls){ try{ const res = await analyzeUrl(u, proxy); for(const f of res.findings){ aggregate.push({source:res.source, link:f.link, linkText:f.linkText, mimeHint:f.mimeHint, snippet:f.snippet, accessible:f.accessible}); } }catch(e){ log('Error scanning '+u+': '+e) } }
+ if(aggregate.length===0) log('No candidate datasets found.'); else log('Total candidates: '+aggregate.length);
+ // render table
+ const out = ['<h3>Findings</h3><pre>']; for(const a of aggregate){ out.push('source: '+a.source+'\n link: '+a.link+'\n hint: '+(a.mimeHint||'')+'\n snippet: '+(a.snippet||'')+'\n'); out.push('---\n'); } out.push('</pre>'); document.getElementById('log').innerHTML = out.join('');
+ const csv = toCsv(aggregate);
+ document.getElementById('download').disabled = (aggregate.length===0);
+ document.getElementById('download').dataset.csv = csv;
+ });
+
+document.getElementById('download').addEventListener('click', ()=>{
+ const csv = document.getElementById('download').dataset.csv || '';
+ const blob = new Blob([csv],{type:'text/csv'});
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a'); a.href = url; a.download = 'pose_datasets_report.csv'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
